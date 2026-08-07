@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+dubsync_work/
+*.mkv
+*.wav
+*.ac3
+*.raw
+.DS_Store
