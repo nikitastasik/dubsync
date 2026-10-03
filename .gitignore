@@ -8,3 +8,4 @@ dubsync_work/
 *.ac3
 *.raw
 .DS_Store
+.idea/

@@ -133,18 +133,37 @@ def fine_map(f4, fh, rate, predict, cuts, node=5.0, win=12.0, search=1.6):
     return np.array(rows)
 
 
+def _local_line(t, d, x, half):
+    """Значение локальной прямой в точке x по узлам в окне ±half."""
+    w = np.abs(t - x) < half
+    if w.sum() < 3:
+        return None
+    return float(np.polyfit(t[w] - x, d[w], 1)[1])
+
+
 def smooth_map(nodes, edges, duration, q_min=0.45, conf_min=0.10,
-               outlier=0.30, window=25.0, bias=0.0):
+               outlier=0.30, window=25.0, bias=0.0, outlier_window=15.0):
     """Гладкая функция смещения с разрывами на склейках.
 
-    Возвращает (моменты, смещения, точки разрыва) — готово для рендера.
+    Выброс определяется относительно локальной прямой, а не медианы: при
+    крутом дрейфе (бывает до 10% скорости) медиана за полминуты уходит на
+    секунды и выкидывает нормальные замеры.
+
+    Возвращает (моменты, смещения, точки разрыва, шум узлов).
     """
     ok = ~np.isnan(nodes[:, 1]) & (nodes[:, 2] > q_min) & (nodes[:, 3] > conf_min)
     t, d = nodes[ok, 0], nodes[ok, 1]
     if len(t) < 3:
-        raise RuntimeError('слишком мало надёжных узлов — проверьте исходники')
-    med = np.array([np.median(d[np.abs(t - x) < 30]) for x in t])
-    keep = np.abs(d - med) < outlier
+        raise RuntimeError('слишком мало надёжных узлов, проверьте исходники')
+    cut_list = [e['cut'] for e in edges]
+    seg = np.searchsorted(np.array(cut_list), t)
+    keep = np.ones(len(t), bool)
+    for _ in range(2):
+        for i in range(len(t)):
+            same = (seg == seg[i]) & keep
+            same[i] = False
+            v = _local_line(t[same], d[same], t[i], outlier_window)
+            keep[i] = v is None or abs(d[i] - v) < outlier
     t, d = t[keep], d[keep]
 
     cuts = [e['cut'] for e in edges]

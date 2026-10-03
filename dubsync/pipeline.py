@@ -26,7 +26,8 @@ def _cached(path, produce, what):
 
 
 def run(target, source, out_path, work, source_audio=0, title=None,
-        codec='ac3', bitrate='448k', hwaccel=True):
+        codec='ac3', bitrate='448k', hwaccel=True, offset_range=(-10.0, 100.0),
+        keep_pitch=False):
     """target — файл с нужной картинкой; source — файл с нужной озвучкой."""
     os.makedirs(work, exist_ok=True)
     report = {'target': target, 'source': source, 'output': out_path}
@@ -60,7 +61,8 @@ def run(target, source, out_path, work, source_audio=0, title=None,
     rate = tinfo['rate']
 
     _say('грубая карта…')
-    ct, co, cq = align.coarse_map(F4, FH, rate)
+    ct, co, cq = align.coarse_map(F4, FH, rate,
+                                  dmin=offset_range[0], dmax=offset_range[1])
     inserts = align.find_inserts(ct, co)
     _say(f'качество сопоставления: медиана {np.median(cq):.3f}; '
          f'найдено вставок: {len(inserts)}')
@@ -69,10 +71,15 @@ def run(target, source, out_path, work, source_audio=0, title=None,
     edges = []
     for t_guess, ob, oa in inserts:
         e = align.refine_edge(F4, FH, rate, t_guess, ob, oa)
-        edges.append(e)
+        # ложные вставки: крутой дрейф даёт скачок грубой карты, но при
+        # уточнении оба края ложатся плохо или «реклама» выходит в секунду
+        real = min(e['q_left'], e['q_right']) >= 0.6 and e['length'] >= 3.0
         _say(f'  склейка {e["cut"]:.3f} с: реклама в источнике '
              f'[{e["ad_start"]:.2f} .. {e["ad_end"]:.2f}] '
-             f'({e["length"]:.2f} с), качество {e["q_left"]:.2f}/{e["q_right"]:.2f}')
+             f'({e["length"]:.2f} с), качество {e["q_left"]:.2f}/{e["q_right"]:.2f}'
+             f'{"" if real else "  -> не вставка, отброшено"}')
+        if real:
+            edges.append(e)
     report['inserts'] = edges
 
     cuts = [e['cut'] for e in edges]
@@ -81,7 +88,10 @@ def run(target, source, out_path, work, source_audio=0, title=None,
         return float(np.interp(t, ct, co))
 
     _say('точная карта…')
-    nodes = align.fine_map(F4, FH, rate, predict, cuts)
+    # узлы каждую секунду: скорость источника может гулять на проценты
+    # за десятки секунд, редкие узлы срезают такие повороты
+    nodes = align.fine_map(F4, FH, rate, predict, cuts, node=1.0, win=4.0, search=2.0)
+    np.save(os.path.join(work, 'nodes.npy'), nodes)
     ok = ~np.isnan(nodes[:, 1])
     _say(f'узлов {len(nodes)}, измерено {ok.sum()}, '
          f'качество медиана {np.median(nodes[ok, 2]):.3f}')
@@ -99,12 +109,14 @@ def run(target, source, out_path, work, source_audio=0, title=None,
             'звук источника (анализ)')
     ahd = audio.features(a_s8)
 
-    bias, nb = align.audio_bias(a4, ahd, nodes, cuts, audio.FPS)
+    map_t, map_d, cut_arr, noise = align.smooth_map(
+        nodes, edges, tinfo['duration'], window=8.0)
+    # сдвиг звук/картинка меряем относительно уже гладкой карты
+    smooth_nodes = np.c_[map_t, map_d, np.ones_like(map_t), np.ones_like(map_t)]
+    bias, nb = align.audio_bias(a4, ahd, smooth_nodes, cuts, audio.FPS)
     _say(f'сдвиг звука относительно картинки: {bias*1000:+.0f} мс (по {nb} замерам)')
     report['audio_bias_ms'] = bias * 1000
-
-    map_t, map_d, cut_arr, noise = align.smooth_map(
-        nodes, edges, tinfo['duration'], bias=bias)
+    map_d = map_d + bias
     _say(f'карта готова: смещение {map_d.min():+.2f}..{map_d.max():+.2f} с, '
          f'шум узлов {noise*1000:.0f} мс')
     report['offset_min'] = float(map_d.min())
@@ -120,8 +132,32 @@ def run(target, source, out_path, work, source_audio=0, title=None,
             'звук источника (полный)')
 
     synced = os.path.join(work, 'synced.wav')
-    _say('перекладка звука…')
-    render.resample(a_full, synced, map_t, map_d, cut_arr, tinfo['duration'])
+
+    def do_render(d):
+        if keep_pitch:
+            render.stretch(a_full, synced, map_t, d, cut_arr, tinfo['duration'])
+        else:
+            render.resample(a_full, synced, map_t, d, cut_arr, tinfo['duration'])
+
+    _say('перекладка звука…' + (' с сохранением тона (WSOLA)' if keep_pitch else ''))
+    do_render(map_d)
+
+    # замкнутый контур: поправку звук/картинка мерили по исходнику, а
+    # теперь меряем то, что вышло. Если готовый звук всё ещё заметно
+    # опережает или отстаёт, сдвигаем карту на остаток и рендерим ещё раз.
+    chk8 = os.path.join(work, 'synced_8k.wav')
+    ff.run(['ffmpeg', '-v', 'error', '-y', '-i', synced, '-ac', '1', '-ar',
+            str(audio.SR), '-c:a', 'pcm_s16le', chk8])
+    pre = verify.residual_sync(a4, audio.features(chk8), audio.FPS, cuts)
+    _say(f'  рассинхрон после рендера: медиана {pre["median_ms"]:+.0f} мс '
+         f'по {pre["n_good"]} замерам')
+    if abs(pre['median_ms']) > 15 and pre['n_good'] >= 30:
+        fix = pre['median_ms'] / 1000
+        map_d = map_d + fix
+        report['audio_bias_ms'] += fix * 1000
+        np.save(os.path.join(work, 'map_d.npy'), map_d)
+        _say(f'  поправка {fix*1000:+.0f} мс, рендер заново…')
+        do_render(map_d)
     sp = render.splice_check(synced, cut_arr)
     for s in sp:
         _say(f'  стык {s["cut"]:.2f} с: скачок {s["jump"]:.0f} '

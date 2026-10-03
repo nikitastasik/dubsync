@@ -28,6 +28,14 @@ def main():
     p.add_argument('--title', default=None, help='название новой дорожки')
     p.add_argument('--codec', default='ac3', help='кодек новой дорожки (ac3, aac, flac)')
     p.add_argument('--bitrate', default='448k', help='битрейт новой дорожки')
+    p.add_argument('--offset-min', type=float, default=-10.0,
+                   help='нижняя граница поиска сдвига источника относительно цели, с')
+    p.add_argument('--offset-max', type=float, default=100.0,
+                   help='верхняя граница поиска сдвига, с (суммарная длина вставок '
+                        'плюс запас на дрейф)')
+    p.add_argument('--keep-pitch', action='store_true',
+                   help='менять темп звука с сохранением тона (нужно для TS и '
+                        'других источников, где темп уже правили)')
     p.add_argument('--no-hwaccel', action='store_true',
                    help='отключить аппаратное декодирование при разборе кадров')
     p.add_argument('--list-audio', action='store_true',
@@ -52,7 +60,9 @@ def main():
                                   'dubsync_work')
     pipeline.run(a.target, a.source, a.out, work,
                  source_audio=a.source_audio, title=a.title,
-                 codec=a.codec, bitrate=a.bitrate, hwaccel=not a.no_hwaccel)
+                 codec=a.codec, bitrate=a.bitrate, hwaccel=not a.no_hwaccel,
+                 offset_range=(a.offset_min, a.offset_max),
+                 keep_pitch=a.keep_pitch)
 
 
 if __name__ == '__main__':
